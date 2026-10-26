@@ -77,10 +77,11 @@ static class Repro
     static int Main(string[] args)
     {
         string mode = args.Length > 0 ? args[0] : "popup";
+        // focus takes <match> <ms>; every other mode takes <ms>.
+        if (mode == "focus") return Focus(args[1], args.Length > 2 ? int.Parse(args[2]) : 4000);
         int hold = args.Length > 1 ? int.Parse(args[1]) : 4000;
         if (mode == "frame") return Frame(hold);
         if (mode == "steal") return Steal(hold);
-        if (mode == "focus") return Focus(args[2], hold);
         return Popup(hold);
     }
 

@@ -19,6 +19,17 @@
 //   taskbar-autohide.exe --log  also trace every foreground event, not just the
 //                               decisions (taskbar-autohide.log, capped at 256 KB)
 //
+// Two things the appbar state cannot tell you, and v1.2 has to:
+//   * The tray window can be *parked* on screen while auto-hide says "on". A
+//     transition to auto-hide made while the pointer is on the taskbar does it
+//     (clicking a taskbar button is exactly that), and nothing in explorer ever
+//     moves the tray back - the work area is already correct, so nothing here
+//     used to notice. See TrayOut / Verify.
+//   * The shell itself can hold the focus - a taskbar click, Start, a flyout -
+//     without the user having switched to another document. Judging the taskbar
+//     from a stand-in window in that moment is what made it pop out and stay
+//     out. See ShellSurfaces / Decide.
+//
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
 using System;
@@ -51,6 +62,7 @@ static class Program
     // Window inspection
     const int GWL_EXSTYLE = -20;
     const uint GW_HWNDNEXT = 2;
+    const uint GA_ROOTOWNER = 3;
     const int WS_EX_TOOLWINDOW = 0x00000080;
     const int WS_EX_NOACTIVATE = 0x08000000;
     const int DWMWA_CLOAKED = 14;
@@ -60,6 +72,9 @@ static class Program
 
     [StructLayout(LayoutKind.Sequential)]
     struct RECT { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct POINT { public int X, Y; }
 
     [StructLayout(LayoutKind.Sequential)]
     struct APPBARDATA
@@ -126,21 +141,36 @@ static class Program
     [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG m);
     [DllImport("user32.dll")] static extern IntPtr GetTopWindow(IntPtr hWnd);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLongW(IntPtr hWnd, int index);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr,
         out int value, int size);
 
-    // Shell surfaces that must not flip the state: taskbar itself, Start, search,
-    // flyouts, alt-tab. Ignoring them keeps a maximized window's state intact
-    // while the user pokes at the shell.
-    static readonly string[] Ignored = {
+    // Surfaces that belong to the shell itself. While one of them has the focus
+    // the user is poking at the shell - a taskbar button, Start, search, the
+    // alt-tab switcher, a flyout - not switching between documents. The taskbar
+    // keeps the state it had; the window the user ends up looking at fires its
+    // own foreground event a moment later.
+    //
+    // Judging these from a stand-in window instead (what v1.1 did) is how a
+    // click on the taskbar turned into "the topmost other window is not
+    // maximized, so show the taskbar" - and the taskbar then stayed out.
+    static readonly string[] ShellSurfaces = {
         "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow",
-        "TaskListThumbnailWnd", "Windows.UI.Core.CoreWindow",
-        "XamlExplorerHostIslandWindow", "MultitaskingViewFrame",
-        "ForegroundStaging", "TopLevelWindowForOverflowXamlIsland",
-        "TaskView", "TaskSwitcherWnd", "Shell_InputSwitchTopLevelWindow",
-        "ThumbnailDeviceHelperWnd"
+        "TaskListThumbnailWnd", "XamlExplorerHostIslandWindow",
+        "XamlExplorerHostIslandWindow_WASDK", "MultitaskingViewFrame",
+        "TopLevelWindowForOverflowXamlIsland", "TaskView", "TaskSwitcherWnd",
+        "Shell_InputSwitchTopLevelWindow"
+    };
+
+    // Never a window a user can be looking at, but not a shell surface either:
+    // while one of these holds the focus an activation is still in flight, so
+    // the state is judged from a stand-in window (see Decide).
+    static readonly string[] HelperWindows = {
+        "ForegroundStaging", "Windows.UI.Core.CoreWindow",
+        "ThumbnailDeviceHelperWnd", "ApplicationManager_DesktopShellWindow"
     };
 
     static readonly string[] Desktop = { "Progman", "WorkerW" };
@@ -149,13 +179,19 @@ static class Program
     static readonly IntPtr[] _hooks = new IntPtr[4];
     static Timer _debounce;
     static Timer _safety;                // periodic reality check, see OnSafety
+    static Timer _verify;                // post-apply check of the tray itself
     static bool _pending;                // a debounce tick is already armed
     static bool _standInArmed;           // a stand-in decision waits for the settle delay
     static IntPtr _subject;              // window the last decision was based on
+    static IntPtr _lastUsable;           // last window the user really had in front
     static string _lastSkip;             // last "cannot decide" reason, for the log only
     static DateTime _lastApply = DateTime.MinValue;
     static DateTime _lastSafetyApply = DateTime.MinValue;   // see OnSafety
     static string _lastSafetyTarget;
+    static int _unwedges;                // corrective toggles since the tray last moved
+    static int _trayParked;              // visible tray height on the last verify pass
+    static DateTime _trayParkedAt = DateTime.MinValue;
+    static int _defers;                  // applies held back while the pointer is on the tray
     static readonly object Gate = new object();        // guards _debounce.Change only
     static readonly object SubjectGate = new object(); // guards _subject
     static readonly object ApplyLock = new object();   // serializes decision + apply
@@ -203,6 +239,7 @@ static class Program
                 IntPtr.Zero, _proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
             _debounce = new Timer(OnDebounce, null, Timeout.Infinite, Timeout.Infinite);
+            _verify = new Timer(OnVerify, null, Timeout.Infinite, Timeout.Infinite);
             // Explorer restarts (taskbar recreated, auto-hide back to "off"), the
             // user flipping the setting, a missed event: none of those produce a
             // hook callback, so re-check reality on a slow timer.
@@ -235,6 +272,11 @@ static class Program
             _pending = true;
             _debounce.Change(ms, Timeout.Infinite);
         }
+    }
+
+    static void ArmVerify(int ms)
+    {
+        if (_verify != null) _verify.Change(ms, Timeout.Infinite);
     }
 
     static void OnWinEvent(IntPtr hook, uint evt, IntPtr hwnd,
@@ -294,13 +336,25 @@ static class Program
             Verdict v = Decide();
             if (v.State == null) return;
             string actual = ActualState();
-            if (actual == null || actual == v.State) { _lastSafetyTarget = null; return; }
+            if (actual == null) return;
 
-            if (v.State == _lastSafetyTarget &&
-                (DateTime.UtcNow - _lastSafetyApply).TotalSeconds < 6) return;
+            if (actual != v.State)
+            {
+                if (v.State == _lastSafetyTarget &&
+                    (DateTime.UtcNow - _lastSafetyApply).TotalSeconds < 6) return;
+                Apply();
+                return;
+            }
 
-            Apply();
+            // State agrees; the tray may still be parked on screen.
+            if (v.State == "on") Verify();
         }
+        catch { }
+    }
+
+    static void OnVerify(object state)
+    {
+        try { Verify(); }
         catch { }
     }
 
@@ -328,7 +382,8 @@ static class Program
             string actual = ActualState();
             if (actual == null) return;
 
-            LogEvent("evaluate: " + v.Why + " target=" + v.State + " actual=" + actual);
+            LogEvent("evaluate: " + v.Why + " target=" + v.State + " actual=" + actual
+                + " tray=" + (TrayOut() ? "out" : "in"));
 
             if (v.State == actual)
             {
@@ -336,6 +391,9 @@ static class Program
                 // ran and agreed with what the taskbar shows.
                 if (v.StandIn) Log("stand-in " + v.State + " confirmed: " + v.Why);
                 _standInArmed = false;
+                _defers = 0;
+                // The appbar state is right, the tray may not be - see Verify.
+                if (v.State == "on" && TrayOut() && !PointerOnTray()) ArmVerify(250);
                 return;
             }
 
@@ -352,6 +410,21 @@ static class Program
             }
             _standInArmed = false;
 
+            // Turning auto-hide ON while the pointer is on the taskbar leaves the
+            // tray parked on screen (measured on 26300: it stays out until the
+            // state is toggled by hand). The pointer is there because the user
+            // just clicked a taskbar button; wait for them to move into the
+            // window and apply then. 250 ms is enough to catch that, and a
+            // pointer that stays put for 10 s is a deliberate peek anyway.
+            if (v.State == "on" && PointerOnTray() && _defers < 40)
+            {
+                _defers++;
+                LogEvent("  defer: pointer on the taskbar");
+                Arm(250, true);
+                return;
+            }
+            _defers = 0;
+
             double since = (DateTime.UtcNow - _lastApply).TotalMilliseconds;
             if (since < 120)
             {
@@ -367,7 +440,55 @@ static class Program
             LogEvent("  APPLIED " + v.State);
             // No verification here on purpose: SHAppBarMessage can return before
             // explorer has finished moving the work area, so sampling now gives
-            // false failures. OnSafety re-checks two seconds later.
+            // false failures. The verify timer re-checks once it has settled.
+            if (v.State == "on") ArmVerify(520);
+        }
+    }
+
+    // The appbar state and the tray's position are two different things, and it
+    // is the position the user sees. While auto-hide is on the tray is expected
+    // to sit 2 px below the bottom edge; a tray that is still on screen with the
+    // pointer nowhere near it is a peek the shell never took back. Nothing in
+    // explorer recovers from that on its own (measured: it stays out for
+    // minutes), so toggle auto-hide off and on again - that is what moves it,
+    // and it is the only thing that does: re-sending the same state is a no-op.
+    static void Verify()
+    {
+        // Same lock as Apply: this moves the taskbar, and a decision landing in
+        // the middle of the off/on pair would act on a half-applied state.
+        lock (ApplyLock)
+        {
+            if (ActualState() != "on") { _trayParked = 0; _unwedges = 0; return; }
+
+            int px = TrayVisiblePixels();
+            if (px <= 4) { _trayParked = 0; _unwedges = 0; return; }   // tucked away: fine
+            if (PointerOnTray()) { _trayParked = 0; return; }          // a peek in progress
+
+            // A peek the pointer has just left keeps sliding for ~600 ms, and the
+            // slide changes the visible height on every sample. Only a tray that
+            // sits in the same place for most of a second was left behind.
+            if (px != _trayParked)
+            {
+                _trayParked = px;
+                _trayParkedAt = DateTime.UtcNow;
+                ArmVerify(450);
+                return;
+            }
+            if ((DateTime.UtcNow - _trayParkedAt).TotalMilliseconds < 800)
+            {
+                ArmVerify(450);
+                return;
+            }
+
+            if (++_unwedges > 3) return;    // a shell that keeps refusing: stop fighting it
+            Log("wedge: tray parked on screen with auto-hide on -> toggling");
+            SetAutoHide(false);
+            Thread.Sleep(150);
+            SetAutoHide(true);
+            _lastApply = DateTime.UtcNow;
+            _lastSafetyApply = DateTime.UtcNow;
+            _lastSafetyTarget = "on";
+            ArmVerify(700);                 // and look again once it has settled
         }
     }
 
@@ -404,45 +525,58 @@ static class Program
     {
         Verdict v = new Verdict();
         IntPtr h = GetForegroundWindow();
-        string why = "fg=none";
 
-        if (h != IntPtr.Zero)
+        if (h == IntPtr.Zero) { v.Why = "fg=none"; return v; }
+
+        string cls = ClassOf(h);
+
+        // The desktop is in front: the taskbar belongs on screen.
+        if (Array.IndexOf(Desktop, cls) >= 0)
         {
-            string cls = ClassOf(h);
-            bool desktop = Array.IndexOf(Desktop, cls) >= 0;
-            bool shell = Array.IndexOf(Ignored, cls) >= 0;
-            bool visible = IsWindowVisible(h);
-
-            // The desktop is in front: the taskbar belongs on screen.
-            if (desktop)
-            {
-                v.State = "off"; v.Subject = h; v.Why = "fg=" + cls;
-                return v;
-            }
-            // A real window the user can see and is looking at.
-            if (!shell && visible)
-            {
-                v.State = IsIconic(h) ? "off" : StateOf(h);
-                v.Subject = h; v.Why = "fg=" + cls;
-                return v;
-            }
-            why = "fg=" + (shell ? "shell:" : "") + cls + (visible ? "" : "[hidden]");
+            v.State = "off"; v.Subject = h; v.Why = "fg=" + cls;
+            return v;
         }
 
-        // The foreground window is unusable: a shell surface, a hidden helper, or
-        // nothing at all. This is where the taskbar used to freeze. WeChat hands
-        // the foreground to its own hidden window when a chat popup closes, and
-        // WPS does the same when a document is activated from the taskbar - both
-        // left "no foreground" behind, the old code answered "leave the state
-        // alone", and the taskbar stayed visible over a maximized window.
-        // Judge by the topmost window the user can actually see instead.
-        IntPtr s = TopmostUserWindow();
+        bool shell = Array.IndexOf(ShellSurfaces, cls) >= 0;
+        bool helper = Array.IndexOf(HelperWindows, cls) >= 0;
+        bool visible = IsWindowVisible(h);
+
+        // A real window the user can see and is looking at.
+        if (!shell && !helper && visible)
+        {
+            v.State = IsIconic(h) ? "off" : StateOf(h);
+            v.Subject = h; v.Why = "fg=" + cls;
+            if (!IsIconic(h)) _lastUsable = h;
+            return v;
+        }
+
+        // The shell has the focus: a taskbar click, Start, search, alt-tab, a
+        // flyout. The user is poking at the shell, not changing what is on
+        // screen, so the taskbar keeps whatever state it had - the window they
+        // are actually working in fires its own foreground event right after.
+        // Guessing from another window here is what used to pop the taskbar out
+        // on a taskbar click and leave it out.
+        if (shell) { v.Why = "fg=shell:" + cls; return v; }
+
+        // The foreground is unusable - a hidden helper (WeChat hands one the
+        // focus when a chat popup closes, WPS when a document is activated from
+        // the taskbar). Judge by, in order: the window the helper belongs to,
+        // the topmost window the user can see, the window they were last really
+        // working in.
+        string why = "fg=" + (helper ? "helper:" : "") + cls + (visible ? "" : "[hidden]");
+        IntPtr s = IntPtr.Zero;
+        string how = null;
+
+        IntPtr owner = GetAncestor(h, GA_ROOTOWNER);
+        if (owner != IntPtr.Zero && owner != h && IsUserWindow(owner)) { s = owner; how = "owner"; }
+        if (s == IntPtr.Zero) { s = TopmostUserWindow(); if (s != IntPtr.Zero) how = "z-order"; }
+        if (s == IntPtr.Zero && IsUserWindow(_lastUsable)) { s = _lastUsable; how = "last"; }
         if (s == IntPtr.Zero) { v.Why = why + " -> no-candidate"; return v; }
 
         v.Subject = s;
         v.State = StateOf(s);
         v.StandIn = true;
-        v.Why = why + " -> stand-in=" + Describe(s);
+        v.Why = why + " -> stand-in(" + how + ")=" + Describe(s);
         return v;
     }
 
@@ -452,8 +586,9 @@ static class Program
     }
 
     // Topmost window a user could plausibly be looking at, in z-order. Skips the
-    // desktop, the shell surfaces above, and anything invisible, minimized,
-    // cloaked (a suspended UWP app), tool or no-activate (a tray / overlay host).
+    // desktop, the shell surfaces and helpers above, and anything invisible,
+    // minimized, cloaked (a suspended UWP app), tool or no-activate (a tray /
+    // overlay host), or parked off screen.
     static IntPtr TopmostUserWindow()
     {
         IntPtr h = GetTopWindow(IntPtr.Zero);
@@ -468,12 +603,14 @@ static class Program
 
     static bool IsUserWindow(IntPtr h)
     {
+        if (h == IntPtr.Zero) return false;
         if (!IsWindowVisible(h)) return false;
         if (IsIconic(h)) return false;
 
         string cls = ClassOf(h);
         if (Array.IndexOf(Desktop, cls) >= 0) return false;
-        if (Array.IndexOf(Ignored, cls) >= 0) return false;
+        if (Array.IndexOf(ShellSurfaces, cls) >= 0) return false;
+        if (Array.IndexOf(HelperWindows, cls) >= 0) return false;
         if (IsCloaked(h)) return false;
 
         int ex = GetWindowLongW(h, GWL_EXSTYLE);
@@ -483,6 +620,14 @@ static class Program
         RECT r;
         if (!GetWindowRect(h, out r)) return false;
         if (r.Right - r.Left <= 0 || r.Bottom - r.Top <= 0) return false;
+
+        // On screen. Apps keep helper windows WS_VISIBLE at -32000,-32000 or
+        // just outside the frame; they are real windows by every API here and
+        // would be picked as "the topmost thing the user sees".
+        MONITORINFO mi;
+        if (!PrimaryMonitor(out mi)) return true;
+        if (r.Right <= mi.rcMonitor.Left || r.Left >= mi.rcMonitor.Right) return false;
+        if (r.Bottom <= mi.rcMonitor.Top || r.Top >= mi.rcMonitor.Bottom) return false;
         return true;
     }
 
@@ -493,17 +638,70 @@ static class Program
         return cloaked != 0;
     }
 
-    // "on" = the taskbar reserves no space in the primary work area (auto-hidden),
-    // "off" = it does. Cheap enough (two user32 calls) to run on every decision.
+    // "on" = the taskbar reserves no space in the primary work area (auto-hide is
+    // on), "off" = it does. This is the appbar's own idea of the state, and it
+    // says nothing about where the tray window actually is - see TrayOut.
     static string ActualState()
     {
-        MONITORINFO mi = new MONITORINFO();
-        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
-        if (!GetMonitorInfo(MonitorFromWindow(IntPtr.Zero, MONITOR_DEFAULTTOPRIMARY), ref mi))
-            return null;
+        MONITORINFO mi;
+        if (!PrimaryMonitor(out mi)) return null;
         int monitor = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
         int work = mi.rcWork.Bottom - mi.rcWork.Top;
         return (monitor - work >= 8) ? "off" : "on";
+    }
+
+    // Is more than a sliver of the tray window on screen? Auto-hidden keeps it
+    // two pixels past the bottom edge; shown/peeked puts the whole 48 px on it.
+    static bool TrayOut()
+    {
+        return TrayVisiblePixels() > 4;
+    }
+
+    // How many pixels of the tray window the user can see (0 when it is tucked
+    // under the bottom edge, and for any taskbar that is not on the bottom).
+    static int TrayVisiblePixels()
+    {
+        IntPtr t = FindWindow("Shell_TrayWnd", null);
+        if (t == IntPtr.Zero) return 0;
+        RECT r;
+        if (!GetWindowRect(t, out r)) return 0;
+
+        MONITORINFO mi;
+        if (!PrimaryMonitor(out mi)) return 0;
+        if (r.Top < mi.rcMonitor.Top + (mi.rcMonitor.Bottom - mi.rcMonitor.Top) / 2)
+            return 0;                                       // not a bottom taskbar
+        int visible = Math.Min(r.Bottom, mi.rcMonitor.Bottom) - Math.Max(r.Top, mi.rcMonitor.Top);
+        return visible > 0 ? visible : 0;
+    }
+
+    // Is the pointer on the taskbar (or on the bottom edge where an auto-hidden
+    // one slides out)? While it is, the tray being on screen is the user's own
+    // peek and must not be fought.
+    static bool PointerOnTray()
+    {
+        POINT p;
+        if (!GetCursorPos(out p)) return false;
+        MONITORINFO mi;
+        if (!PrimaryMonitor(out mi)) return false;
+
+        int bottom = mi.rcMonitor.Bottom;
+        int top = bottom - 48;
+        IntPtr t = FindWindow("Shell_TrayWnd", null);
+        RECT r;
+        if (t != IntPtr.Zero && GetWindowRect(t, out r))
+        {
+            int h = r.Bottom - r.Top;
+            if (h >= 20 && h <= 120) top = bottom - h;
+            if (TrayOut()) top = r.Top;
+        }
+        return p.Y >= top - 2 && p.Y <= bottom;
+    }
+
+    static bool PrimaryMonitor(out MONITORINFO mi)
+    {
+        mi = new MONITORINFO();
+        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        return GetMonitorInfo(MonitorFromWindow(IntPtr.Zero, MONITOR_DEFAULTTOPRIMARY), ref mi);
     }
 
     static bool IsFullscreen(IntPtr h)
