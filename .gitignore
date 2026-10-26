@@ -1,3 +1,4 @@
 *.log
 *.pdb
 *.user
+test/*.exe
