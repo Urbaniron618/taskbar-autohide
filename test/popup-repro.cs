@@ -82,6 +82,7 @@ static class Repro
         int hold = args.Length > 1 ? int.Parse(args[1]) : 4000;
         if (mode == "frame") return Frame(hold);
         if (mode == "steal") return Steal(hold);
+        if (mode == "tool") return Tool(hold);
         return Popup(hold);
     }
 
@@ -137,6 +138,37 @@ static class Repro
         SleepPump(600);
         Console.WriteLine("fg=" + Describe(GetForegroundWindow()));
         SleepPump(hold);
+        return 0;
+    }
+
+    // A visible *tool* window takes the foreground in front of a maximized
+    // window - the shape WeChat's Qt tool popups (Qt5QWindowToolSaveBits) have.
+    // A tool window is never a window the user works in; the taskbar has to keep
+    // following the window behind it.
+    static int Tool(int hold)
+    {
+        IntPtr frame = CreateWindowEx(0, "STATIC", "repro tool frame",
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 120, 800, 600,
+            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        ShowWindow(frame, SW_MAXIMIZE);
+        ForceForeground(frame);
+        SleepPump(800);
+        Console.WriteLine("frame " + Describe(frame) + " fg=" + Describe(GetForegroundWindow()));
+
+        IntPtr tip = CreateWindowEx(0x00000080 /* WS_EX_TOOLWINDOW */, "STATIC",
+            "repro tool", WS_POPUP | WS_VISIBLE, 700, 500, 240, 120,
+            frame, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        ShowWindow(tip, SW_SHOW);
+        ForceForeground(tip);
+        SleepPump(300);
+        Console.WriteLine("tool  " + Describe(tip) + " fg=" + Describe(GetForegroundWindow()));
+
+        int step = 500;
+        for (int waited = 0; waited < hold; waited += step)
+        {
+            SleepPump(step);
+            Console.WriteLine("+" + (waited + step) + " ms : fg=" + Describe(GetForegroundWindow()));
+        }
         return 0;
     }
 

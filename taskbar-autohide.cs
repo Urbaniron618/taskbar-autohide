@@ -30,6 +30,16 @@
 //     from a stand-in window in that moment is what made it pop out and stay
 //     out. See ShellSurfaces / Decide.
 //
+// v1.3, both found with WeChat 4.1.13 (Qt 5.15.14):
+//   * A window that is already maximized does not re-maximize itself when the
+//     taskbar disappears and the work area grows. Explorer does not resize it
+//     either. Notepad follows the new area; WeChat keeps the height it had, so
+//     a 48 px strip of desktop stays below a "maximized" window. See Reflow.
+//   * A visible *tool* window can take the focus (WeChat's Qt popups,
+//     Qt5QWindowToolSaveBits). It is not a window anybody works in, but it was
+//     judged like one - its own, unmaximized size - so the taskbar came out
+//     over a maximized window and stayed out. See Decide.
+//
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
 using System;
@@ -66,6 +76,8 @@ static class Program
     const int WS_EX_TOOLWINDOW = 0x00000080;
     const int WS_EX_NOACTIVATE = 0x08000000;
     const int DWMWA_CLOAKED = 14;
+    const uint SWP_NOZORDER = 0x0004;
+    const uint SWP_NOACTIVATE = 0x0010;
 
     delegate void WinEventProc(IntPtr hWinEventHook, uint evt, IntPtr hwnd,
                                int idObject, int idChild, uint thread, uint time);
@@ -147,6 +159,9 @@ static class Program
     static extern int GetWindowLongW(IntPtr hWnd, int index);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr,
         out int value, int size);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr after,
+        int x, int y, int cx, int cy, uint flags);
 
     // Surfaces that belong to the shell itself. While one of them has the focus
     // the user is poking at the shell - a taskbar button, Start, search, the
@@ -191,6 +206,9 @@ static class Program
     static int _unwedges;                // corrective toggles since the tray last moved
     static int _trayParked;              // visible tray height on the last verify pass
     static DateTime _trayParkedAt = DateTime.MinValue;
+    static IntPtr _reflowed;             // window last pushed onto its work area
+    static DateTime _reflowedAt = DateTime.MinValue;
+    static int _reflows;                 // attempts on that window, in a row
     static int _defers;                  // applies held back while the pointer is on the tray
     static readonly object Gate = new object();        // guards _debounce.Change only
     static readonly object SubjectGate = new object(); // guards _subject
@@ -441,6 +459,11 @@ static class Program
             // No verification here on purpose: SHAppBarMessage can return before
             // explorer has finished moving the work area, so sampling now gives
             // false failures. The verify timer re-checks once it has settled.
+            //
+            // A reflow here would be too early as well: the app has not answered
+            // the work-area change yet, and it re-applies its own rectangle after
+            // ours, which puts the window back where it was. The verify pass is
+            // the first moment the answer is in. See Reflow.
             if (v.State == "on") ArmVerify(520);
         }
     }
@@ -458,7 +481,16 @@ static class Program
         // the middle of the off/on pair would act on a half-applied state.
         lock (ApplyLock)
         {
-            if (ActualState() != "on") { _trayParked = 0; _unwedges = 0; return; }
+            if (ActualState() != "on")
+            {
+                _trayParked = 0; _unwedges = 0;
+                _reflows = 0; _reflowed = IntPtr.Zero;
+                return;
+            }
+
+            // Look again shortly after a nudge: an app that answers the work-area
+            // change late re-applies its old rectangle over ours.
+            if (Reflow()) ArmVerify(700);
 
             int px = TrayVisiblePixels();
             if (px <= 4) { _trayParked = 0; _unwedges = 0; return; }   // tucked away: fine
@@ -490,6 +522,66 @@ static class Program
             _lastSafetyTarget = "on";
             ArmVerify(700);                 // and look again once it has settled
         }
+    }
+
+    // Hiding the taskbar grows the work area, and explorer leaves it to the app
+    // to grow into the new one. Most apps do - Notepad lands at 1721x1081 for a
+    // 1707x1067 monitor - but WeChat (Qt 5.15.14) keeps the size it maximized
+    // to a moment earlier, so a maximized window sits 48 px short and shows a
+    // strip of desktop below it, which is also where the auto-hidden taskbar
+    // slides out from. Nothing in the shell corrects it: a second SC_MAXIMIZE is
+    // ignored, and only a SetWindowPos to the work area moves the window.
+    //
+    // Only ever the window in front (or the window a tool popup belongs to),
+    // only while it is maximized, and only when it does not already cover the
+    // work area - for every well-behaved app this is a no-op.
+    static bool Reflow()
+    {
+        IntPtr fg = GetForegroundWindow();
+        if (fg == IntPtr.Zero) return false;
+        bool moved = FillIfMaximized(fg);
+        IntPtr owner = GetAncestor(fg, GA_ROOTOWNER);
+        if (owner != IntPtr.Zero && owner != fg) moved |= FillIfMaximized(owner);
+        return moved;
+    }
+
+    static bool FillIfMaximized(IntPtr h)
+    {
+        if (h == IntPtr.Zero || !IsWindow(h)) return false;
+        if (!IsWindowVisible(h) || IsIconic(h) || !IsZoomed(h)) return false;
+
+        RECT r;
+        if (!GetWindowRect(h, out r)) return false;
+
+        MONITORINFO mi = new MONITORINFO();
+        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        if (!GetMonitorInfo(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), ref mi)) return false;
+
+        // A maximized window overlaps the work area by the width of its invisible
+        // frame (7 px here). Anything that falls short of it was left behind.
+        if (r.Left <= mi.rcWork.Left && r.Top <= mi.rcWork.Top
+            && r.Right >= mi.rcWork.Right && r.Bottom >= mi.rcWork.Bottom) return false;
+
+        // A nudge can lose a race with the app's own answer to the work-area
+        // change, which lands a few hundred ms later and undoes it. The caller
+        // re-checks after each move, so a short throttle is enough to keep the
+        // safety timer from hammering; the cap ends the argument for good.
+        if (h == _reflowed && (DateTime.UtcNow - _reflowedAt).TotalMilliseconds < 400) return false;
+        if (h != _reflowed) _reflows = 0;
+        if (_reflows >= 4) return false;
+        _reflowed = h;
+        _reflowedAt = DateTime.UtcNow;
+        _reflows++;
+
+        int w = mi.rcWork.Right - mi.rcWork.Left;
+        int ht = mi.rcWork.Bottom - mi.rcWork.Top;
+        LogEvent("  reflow: " + Describe(h) + " " + (r.Right - r.Left) + "x" + (r.Bottom - r.Top)
+            + " -> " + w + "x" + ht);
+        if (!SetWindowPos(h, IntPtr.Zero, mi.rcWork.Left, mi.rcWork.Top, w, ht,
+            SWP_NOZORDER | SWP_NOACTIVATE)) return false;
+        Log("reflow: maximized window left behind by the grown work area -> " + w + "x" + ht
+            + ": " + Describe(h));
+        return true;
     }
 
     static string Describe(IntPtr h)
@@ -541,8 +633,18 @@ static class Program
         bool helper = Array.IndexOf(HelperWindows, cls) >= 0;
         bool visible = IsWindowVisible(h);
 
+        // A tool window - a Qt popup, a tray host, a floating panel - can be
+        // visible and can take the focus, but it is an adjunct of the window it
+        // belongs to, never a window the user works in. Judged on its own (small,
+        // unmaximized) rectangle it says "off" and brings the taskbar out over a
+        // maximized window - WeChat's Qt5QWindowToolSaveBits popups did exactly
+        // that, once a second, for as long as one was up. Send it down the
+        // stand-in path instead; IsUserWindow already refuses to pick one.
+        int ex = GetWindowLongW(h, GWL_EXSTYLE);
+        bool adjunct = (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0;
+
         // A real window the user can see and is looking at.
-        if (!shell && !helper && visible)
+        if (!shell && !helper && visible && !adjunct)
         {
             v.State = IsIconic(h) ? "off" : StateOf(h);
             v.Subject = h; v.Why = "fg=" + cls;
@@ -560,10 +662,11 @@ static class Program
 
         // The foreground is unusable - a hidden helper (WeChat hands one the
         // focus when a chat popup closes, WPS when a document is activated from
-        // the taskbar). Judge by, in order: the window the helper belongs to,
-        // the topmost window the user can see, the window they were last really
-        // working in.
-        string why = "fg=" + (helper ? "helper:" : "") + cls + (visible ? "" : "[hidden]");
+        // the taskbar), a tool window, or nothing at all. Judge by, in order:
+        // the window the helper belongs to, the topmost window the user can see,
+        // the window they were last really working in.
+        string why = "fg=" + (helper ? "helper:" : "") + (adjunct ? "tool:" : "") + cls
+            + (visible ? "" : "[hidden]");
         IntPtr s = IntPtr.Zero;
         string how = null;
 
