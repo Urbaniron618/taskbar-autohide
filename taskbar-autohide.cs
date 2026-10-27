@@ -40,6 +40,19 @@
 //     judged like one - its own, unmaximized size - so the taskbar came out
 //     over a maximized window and stayed out. See Decide.
 //
+// v1.4, found on two apps that hand their work to a new, unmaximized window:
+//   * The bilibili client opens a video into its own player window - a plain
+//     window at 90% x 99% of the work area, never ShowWindow(SW_MAXIMIZE) - and
+//     hands it the foreground for a second. IsZoomed said "small window", the
+//     taskbar came out over the video and slid back in when the list window
+//     returned. A window that covers nearly the whole work area is now judged
+//     like a maximized one. See CoversWorkArea.
+//   * Steam's Big Picture window is borderless and 1 px short of the monitor
+//     (1707x1066 on a 1707x1067 desktop), so an exact fullscreen test refused
+//     it and the taskbar stayed out over the whole picture. A few pixels of
+//     slack cannot confuse a maximized window (48 px short while the taskbar is
+//     out) for a fullscreen one. See IsFullscreen.
+//
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
 using System;
@@ -78,6 +91,15 @@ static class Program
     const int DWMWA_CLOAKED = 14;
     const uint SWP_NOZORDER = 0x0004;
     const uint SWP_NOACTIVATE = 0x0010;
+
+    // A borderless "fullscreen" window can be a pixel or two short; a maximized
+    // window is a whole taskbar short. Four pixels tells them apart.
+    const int FullscreenSlack = 4;
+
+    // A window this large on both axes is what the user sees as "maximized",
+    // whether or not it ever called ShowWindow(SW_MAXIMIZE). A snapped half is
+    // 50%, a maximized window is ~101%; video players sit at 85-100%.
+    const int LargeWindowPercent = 85;
 
     delegate void WinEventProc(IntPtr hWinEventHook, uint evt, IntPtr hwnd,
                                int idObject, int idChild, uint thread, uint time);
@@ -685,7 +707,38 @@ static class Program
 
     static string StateOf(IntPtr h)
     {
-        return (IsZoomed(h) || IsFullscreen(h)) ? "on" : "off";
+        return (IsZoomed(h) || IsFullscreen(h) || CoversWorkArea(h)) ? "on" : "off";
+    }
+
+    // Some players and game UIs never call ShowWindow(SW_MAXIMIZE): they size a
+    // plain window to the work area and keep it there. The bilibili client's
+    // video window is 1535x1012 on a 1707x1019 work area - 90% by 99% - so an
+    // IsZoomed test says "small window" while the user sees a video page taking
+    // the whole screen, and the taskbar comes out over it (and flashes on the
+    // way in while the app is still handing the foreground over).
+    //
+    // Measured as the part of the window's own monitor's work area it covers, so
+    // a window filling a secondary screen is judged on that screen and a big
+    // window parked half off screen does not count.
+    static bool CoversWorkArea(IntPtr h)
+    {
+        RECT r;
+        if (!GetWindowRect(h, out r)) return false;
+        MONITORINFO mi = new MONITORINFO();
+        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        if (!GetMonitorInfo(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), ref mi)) return false;
+
+        int w = mi.rcWork.Right - mi.rcWork.Left;
+        int ht = mi.rcWork.Bottom - mi.rcWork.Top;
+        if (w <= 0 || ht <= 0) return false;
+
+        int left = Math.Max(r.Left, mi.rcWork.Left);
+        int top = Math.Max(r.Top, mi.rcWork.Top);
+        int right = Math.Min(r.Right, mi.rcWork.Right);
+        int bottom = Math.Min(r.Bottom, mi.rcWork.Bottom);
+        if (right <= left || bottom <= top) return false;
+        return (right - left) * 100 >= w * LargeWindowPercent
+            && (bottom - top) * 100 >= ht * LargeWindowPercent;
     }
 
     // Topmost window a user could plausibly be looking at, in z-order. Skips the
@@ -814,8 +867,14 @@ static class Program
         MONITORINFO mi = new MONITORINFO();
         mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
         if (!GetMonitorInfo(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), ref mi)) return false;
-        return r.Left <= mi.rcMonitor.Left && r.Top <= mi.rcMonitor.Top
-            && r.Right >= mi.rcMonitor.Right && r.Bottom >= mi.rcMonitor.Bottom;
+        // Slack on purpose: a borderless player sizes itself to the monitor in
+        // its own DPI space and lands a pixel short (Steam Big Picture: 1066 of
+        // 1067). A maximized window is 48 px short here, so 4 cannot confuse it
+        // with a fullscreen one.
+        return r.Left <= mi.rcMonitor.Left + FullscreenSlack
+            && r.Top <= mi.rcMonitor.Top + FullscreenSlack
+            && r.Right >= mi.rcMonitor.Right - FullscreenSlack
+            && r.Bottom >= mi.rcMonitor.Bottom - FullscreenSlack;
     }
 
     static string ClassOf(IntPtr h)

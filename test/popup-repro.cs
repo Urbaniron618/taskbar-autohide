@@ -1,11 +1,13 @@
 // test/popup-repro.cs
 //
-// Test harness for the two reported failures:
+// Test harness for the reported failures:
 //   "a popup closes and the taskbar stops auto-hiding"
 //   "opening an already-open document from the taskbar does the same"
+//   "bilibili: opening a video from a maximized page flashes the taskbar"
+//   "Steam Big Picture: the taskbar does not auto-hide"
 //
-// Both were caused by the foreground window ending up on something the tool
-// would not judge: a hidden helper window, or nothing at all. This harness
+// The first two were caused by the foreground window ending up on something the
+// tool would not judge: a hidden helper window, or nothing at all. This harness
 // recreates that state without WeChat or WPS.
 //
 //   popup-repro.exe frame <ms>   create a maximized window and hold it (the
@@ -18,6 +20,15 @@
 //   popup-repro.exe focus <match> <ms>
 //                                activate the first visible window whose class
 //                                or title contains <match>, like a taskbar click
+//   popup-repro.exe borderless <ms>
+//                                a borderless window the size of the monitor
+//                                minus 1 px, never maximized - Steam Big
+//                                Picture's shape (v1.4's second failure)
+//   popup-repro.exe large <ms>   a plain window at 90% x 99% of the work area -
+//                                the bilibili client's video window (v1.4's
+//                                first failure)
+//   popup-repro.exe small <ms>   the control: 50% x 50%, the taskbar belongs on
+//                                screen
 //
 // Build:
 //   csc /nologo /target:exe /out:popup-repro.exe test\popup-repro.cs
@@ -52,6 +63,23 @@ static class Repro
         public int x, y;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    const uint MONITOR_DEFAULTTOPRIMARY = 1;
+
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+    [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO mi);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern IntPtr CreateWindowEx(uint exStyle, string cls, string name, uint style,
         int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
@@ -83,6 +111,9 @@ static class Repro
         if (mode == "frame") return Frame(hold);
         if (mode == "steal") return Steal(hold);
         if (mode == "tool") return Tool(hold);
+        if (mode == "borderless") return Borderless(hold);
+        if (mode == "large") return Percent("repro large", 90, 99, hold);
+        if (mode == "small") return Percent("repro small", 50, 50, hold);
         return Popup(hold);
     }
 
@@ -207,6 +238,53 @@ static class Repro
             Console.WriteLine("+" + (waited + step) + " ms : fg=" + Describe(GetForegroundWindow()));
         }
         return 0;
+    }
+
+    // Steam Big Picture's shape: borderless, the size of the monitor but one
+    // pixel short, and never ShowWindow(SW_MAXIMIZE). v1.3 called that "not
+    // fullscreen" and left the taskbar out over the whole picture.
+    static int Borderless(int hold)
+    {
+        MONITORINFO mi = Primary();
+        IntPtr h = CreateWindowEx(0, "STATIC", "repro borderless",
+            WS_POPUP | WS_VISIBLE, mi.rcMonitor.Left, mi.rcMonitor.Top,
+            mi.rcMonitor.Right - mi.rcMonitor.Left,
+            mi.rcMonitor.Bottom - mi.rcMonitor.Top - 1,
+            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        ShowWindow(h, SW_SHOW);
+        ForceForeground(h);
+        SleepPump(300);
+        Console.WriteLine("borderless " + Describe(h) + " (monitor minus 1 px, never maximized)");
+        SleepPump(hold);
+        return 0;
+    }
+
+    // The bilibili client's video window: a plain, never-maximized window sized
+    // to a percentage of the work area. v1.3 judged it by IsZoomed, said "small
+    // window", and the taskbar came out over the video and back in again when
+    // the list window returned.
+    static int Percent(string title, int wPct, int hPct, int hold)
+    {
+        MONITORINFO mi = Primary();
+        int w = mi.rcWork.Right - mi.rcWork.Left;
+        int ht = mi.rcWork.Bottom - mi.rcWork.Top;
+        IntPtr h = CreateWindowEx(0, "STATIC", title, WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            mi.rcWork.Left, mi.rcWork.Top, w * wPct / 100, ht * hPct / 100,
+            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        ShowWindow(h, SW_SHOW);
+        ForceForeground(h);
+        SleepPump(300);
+        Console.WriteLine(title + " " + Describe(h) + " (" + wPct + "% x " + hPct + "% of work area)");
+        SleepPump(hold);
+        return 0;
+    }
+
+    static MONITORINFO Primary()
+    {
+        MONITORINFO mi = new MONITORINFO();
+        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        GetMonitorInfo(MonitorFromWindow(IntPtr.Zero, MONITOR_DEFAULTTOPRIMARY), ref mi);
+        return mi;
     }
 
     static void ForceForeground(IntPtr h)
