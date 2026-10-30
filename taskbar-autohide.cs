@@ -60,6 +60,10 @@
 //     maximized. v1.4 judged it "covers the work area" and hid the taskbar, but
 //     Reflow only grew windows that report IsZoomed, so the window stayed 48 px
 //     short and a strip of desktop sat below it. See SizedToWorkAreaWithTrayOut.
+//   * The fill used to wait a fixed 520 ms after the switch. The appbar call
+//     returns with the work area already grown (~50 ms measured), so the wait
+//     only kept the strip on screen; the first verify now comes at 90 ms and
+//     retries until the work area has actually moved. See Apply / Verify.
 //
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
@@ -236,6 +240,7 @@ static class Program
     static IntPtr _lastUsable;           // last window the user really had in front
     static string _lastSkip;             // last "cannot decide" reason, for the log only
     static DateTime _lastApply = DateTime.MinValue;
+    static DateTime _hideAt = DateTime.MinValue;            // last auto-hide ON, see Verify
     static DateTime _lastSafetyApply = DateTime.MinValue;   // see OnSafety
     static string _lastSafetyTarget;
     static int _unwedges;                // corrective toggles since the tray last moved
@@ -491,15 +496,18 @@ static class Program
             _lastSafetyApply = DateTime.UtcNow;
             _lastSafetyTarget = v.State;
             LogEvent("  APPLIED " + v.State);
-            // No verification here on purpose: SHAppBarMessage can return before
-            // explorer has finished moving the work area, so sampling now gives
-            // false failures. The verify timer re-checks once it has settled.
-            //
-            // A reflow here would be too early as well: the app has not answered
-            // the work-area change yet, and it re-applies its own rectangle after
-            // ours, which puts the window back where it was. The verify pass is
-            // the first moment the answer is in. See Reflow.
-            if (v.State == "on") ArmVerify(520);
+            // Check back as soon as the work area has moved, not after a fixed
+            // delay: measured on 26300, SHAppBarMessage returns in ~50 ms with
+            // the work area already grown, so the old 520 ms wait only kept the
+            // strip of desktop below the window on screen half a second longer.
+            // Verify re-arms itself while the work area has not moved yet (the
+            // call can return first), and re-checks 700 ms after a fill, so an
+            // app that answers the work-area change late is still caught.
+            if (v.State == "on")
+            {
+                _hideAt = DateTime.UtcNow;
+                ArmVerify(90);
+            }
         }
     }
 
@@ -520,6 +528,11 @@ static class Program
             {
                 _trayParked = 0; _unwedges = 0;
                 _reflows = 0; _reflowed = IntPtr.Zero;
+                // The work area has not grown yet: arm the verify before the
+                // apply, and explorer is still animating the taskbar. Come back
+                // while that apply is fresh - after that a taskbar that is out
+                // is one the user wants out, not a transition to finish.
+                if ((DateTime.UtcNow - _hideAt).TotalMilliseconds < 700) ArmVerify(80);
                 return;
             }
 
