@@ -62,7 +62,8 @@
 //     short and a strip of desktop sat below it. See SizedToWorkAreaWithTrayOut.
 //   * The fill used to wait a fixed 520 ms after the switch. The appbar call
 //     returns with the work area already grown (~50 ms measured), so the wait
-//     only kept the strip on screen; the first verify now comes at 90 ms and
+//     only kept the strip on screen; the first verify comes 40 ms after the
+//     call returns (was 90) and
 //     retries until the work area has actually moved. See Apply / Verify.
 //   * Better than filling after the switch is filling before it: the appbar
 //     call blocks for 250-530 ms, and a window only gets the space when it
@@ -403,7 +404,7 @@ static class Program
             if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
             if (hwnd != GetForegroundWindow()) return;
             LogEvent("event: location " + Describe(hwnd));
-            Arm(45, false);
+            Arm(25, false);
             return;
         }
 
@@ -443,7 +444,7 @@ static class Program
 
         if (evt != EVENT_SYSTEM_FOREGROUND) return;   // EVENT_OBJECT_SHOW rides in the same range
         LogEvent("event: foreground -> " + Describe(hwnd));
-        Arm(45, false);
+        Arm(25, false);
     }
 
     static void OnDebounce(object state)
@@ -531,8 +532,8 @@ static class Program
             if (v.StandIn && !_standInArmed)
             {
                 _standInArmed = true;
-                LogEvent("  stand-in pending, re-checking in 170 ms");
-                Arm(170, true);
+                LogEvent("  stand-in pending, re-checking in 110 ms");
+                Arm(110, true);
                 return;
             }
             _standInArmed = false;
@@ -581,7 +582,7 @@ static class Program
             if (v.State == "on")
             {
                 _hideAt = DateTime.UtcNow;
-                ArmVerify(90);
+                ArmVerify(40);
             }
         }
     }
