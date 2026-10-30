@@ -64,6 +64,11 @@
 //     returns with the work area already grown (~50 ms measured), so the wait
 //     only kept the strip on screen; the first verify now comes at 90 ms and
 //     retries until the work area has actually moved. See Apply / Verify.
+//   * Better than filling after the switch is filling before it: the appbar
+//     call blocks for 250-530 ms, and a window only gets the space when it
+//     returns. A plain window that already fills the work area is grown to
+//     where the work area is about to be, first, so the taskbar slides away
+//     over a window that is already full screen. See PreFill / UndoPreFill.
 //
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
@@ -246,6 +251,9 @@ static class Program
     static int _unwedges;                // corrective toggles since the tray last moved
     static int _trayParked;              // visible tray height on the last verify pass
     static DateTime _trayParkedAt = DateTime.MinValue;
+    static IntPtr _preFillH;             // window grown before the switch, see PreFill
+    static RECT _preFillR;               // ... and what it was before that
+    static DateTime _preFillAt = DateTime.MinValue;
     static IntPtr _reflowed;             // window last pushed onto its work area
     static DateTime _reflowedAt = DateTime.MinValue;
     static int _reflows;                 // attempts on that window, in a row
@@ -491,6 +499,12 @@ static class Program
                 return;
             }
             Log("change " + actual + " -> " + v.State + ": " + v.Why);
+            // The call below blocks for 250-530 ms and the work area only grows
+            // at the end of it, so a window that fills the work area now sits
+            // 48 px short for that whole stretch. Grow it first, to where the
+            // work area is about to be; the verify pass still fills it
+            // afterwards if the app or the shell undid this. See PreFill.
+            if (v.State == "on") PreFill(); else UndoPreFill();
             SetAutoHide(v.State == "on");
             _lastApply = DateTime.UtcNow;
             _lastSafetyApply = DateTime.UtcNow;
@@ -531,10 +545,13 @@ static class Program
                 // The work area has not grown yet: arm the verify before the
                 // apply, and explorer is still animating the taskbar. Come back
                 // while that apply is fresh - after that a taskbar that is out
-                // is one the user wants out, not a transition to finish.
+                // is one the user wants out, not a transition to finish, and a
+                // window grown for a switch that never happened goes back.
                 if ((DateTime.UtcNow - _hideAt).TotalMilliseconds < 700) ArmVerify(80);
+                else UndoPreFill();
                 return;
             }
+            _preFillH = IntPtr.Zero;    // the switch took: nothing to undo
 
             // Look again shortly after a nudge: an app that answers the work-area
             // change late re-applies its old rectangle over ours.
@@ -570,6 +587,118 @@ static class Program
             _lastSafetyTarget = "on";
             ArmVerify(700);                 // and look again once it has settled
         }
+    }
+
+    // The work area the taskbar is about to give back: the current one with the
+    // tray's band added back at the bottom. Only the primary monitor - the
+    // taskbar this tool toggles lives there (see SetAutoHide).
+    static bool WorkAreaWithTrayOut(MONITORINFO mi, out RECT target)
+    {
+        target = mi.rcWork;
+
+        MONITORINFO pm;
+        if (!PrimaryMonitor(out pm)) return false;
+        if (mi.rcMonitor.Left != pm.rcMonitor.Left || mi.rcMonitor.Top != pm.rcMonitor.Top
+            || mi.rcMonitor.Right != pm.rcMonitor.Right
+            || mi.rcMonitor.Bottom != pm.rcMonitor.Bottom) return false;
+
+        int tray = BottomTrayHeight(mi);
+        if (tray <= 0) return false;
+
+        int bottom = mi.rcWork.Bottom + tray;
+        if (bottom > mi.rcMonitor.Bottom) bottom = mi.rcMonitor.Bottom;
+        if (bottom <= mi.rcWork.Bottom) return false;
+
+        target.Bottom = bottom;
+        return true;
+    }
+
+    // Does the window fill the work area it is on right now? A maximized window
+    // overlaps it by its invisible frame; Explorer's folder window lands on it
+    // to the pixel. This is the "will be left behind" test - anything smaller is
+    // not grown, on purpose (v1.4's deal with the bilibili player).
+    static bool FillsWorkArea(RECT r, MONITORINFO mi)
+    {
+        return r.Left <= mi.rcWork.Left + FlushSlack
+            && r.Top <= mi.rcWork.Top + FlushSlack
+            && r.Right >= mi.rcWork.Right - FlushSlack
+            && r.Bottom >= mi.rcWork.Bottom - FlushSlack;
+    }
+
+    // Grow the window that is about to be left behind *before* the switch, so
+    // the 250-530 ms the appbar call spends moving the taskbar is not also
+    // 250-530 ms of a window sitting 48 px short of a taskbar that has already
+    // given that space away. Measured on 26300: the window is full screen ~60 ms
+    // after the foreground event instead of ~0.5 s.
+    //
+    // Best effort: a maximized window can snap back to its old rectangle while
+    // the work area is still the old one, and the verify pass fills it again
+    // right after (see FillIfLeftBehind). If the switch does not take at all,
+    // UndoPreFill puts the window back where it was.
+    static void PreFill()
+    {
+        IntPtr fg = GetForegroundWindow();
+        if (fg == IntPtr.Zero) return;
+        PreFillWindow(fg);
+        IntPtr owner = GetAncestor(fg, GA_ROOTOWNER);
+        if (owner != IntPtr.Zero && owner != fg) PreFillWindow(owner);
+    }
+
+    static void PreFillWindow(IntPtr h)
+    {
+        if (h == IntPtr.Zero || !IsWindow(h)) return;
+        if (!IsWindowVisible(h) || IsIconic(h)) return;
+        // Already grown by a previous pass that is still waiting for its verify.
+        if (h == _preFillH && (DateTime.UtcNow - _preFillAt).TotalMilliseconds < 2000) return;
+
+        // A maximized window is the shell's business: the window manager snaps
+        // it back to the current maximized rectangle the moment we move it and
+        // lays it out itself when the work area grows (measured - a SetWindowPos
+        // on one is undone in the same millisecond). Only plain windows that
+        // happen to fill the work area - Explorer's folder windows - need this.
+        if (IsZoomed(h)) return;
+
+        RECT r;
+        if (!GetWindowRect(h, out r)) return;
+
+        MONITORINFO mi = new MONITORINFO();
+        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        if (!GetMonitorInfo(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), ref mi)) return;
+
+        if (!FillsWorkArea(r, mi)) return;      // would not be left behind
+
+        RECT target;
+        if (!WorkAreaWithTrayOut(mi, out target)) return;
+
+        _preFillH = h;
+        _preFillR = r;
+        _preFillAt = DateTime.UtcNow;
+        if (!SetWindowPos(h, IntPtr.Zero, target.Left, target.Top,
+            target.Right - target.Left, target.Bottom - target.Top,
+            SWP_NOZORDER | SWP_NOACTIVATE))
+        {
+            _preFillH = IntPtr.Zero;
+            return;
+        }
+        LogEvent("  pre-fill: " + Describe(h) + " " + (r.Right - r.Left) + "x" + (r.Bottom - r.Top)
+            + " -> " + (target.Right - target.Left) + "x" + (target.Bottom - target.Top));
+    }
+
+    // The switch did not take, so the window PreFill grew is 48 px under a
+    // taskbar that is still on screen. Put it back - once, and only while the
+    // attempt is fresh; after that the window belongs to the app again.
+    static void UndoPreFill()
+    {
+        IntPtr h = _preFillH;
+        DateTime at = _preFillAt;
+        _preFillH = IntPtr.Zero;
+        if (h == IntPtr.Zero || !IsWindow(h)) return;
+        if ((DateTime.UtcNow - at).TotalMilliseconds > 1500) return;
+
+        RECT r = _preFillR;
+        Log("pre-fill undone: the taskbar did not go away -> " + Describe(h));
+        SetWindowPos(h, IntPtr.Zero, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     // Hiding the taskbar grows the work area, and explorer leaves it to the app
