@@ -71,6 +71,16 @@
 //     where the work area is about to be, first, so the taskbar slides away
 //     over a window that is already full screen. See PreFill / UndoPreFill.
 //
+// v1.5.6, found right after the release was cut, maximizing WeChat over and
+// over:
+//   * The fill was capped at four attempts per window, to stop fighting an app
+//     that undoes it. But the count was only reset when a *different* window
+//     got filled, so after four maximizes of the same window (WeChat, an
+//     Explorer folder window) the tool stopped filling that window for good:
+//     every later maximize left the 48 px strip of desktop below it until the
+//     tool was restarted. The cap belongs to one transition, so a real switch
+//     starts the count over. See Apply / FillIfLeftBehind.
+//
 // v1.5.3, found while dragging windows around:
 //   * A window under the mouse crosses the "covers 85% of the work area" line
 //     in both directions within a second (drag it bigger, drag it smaller), so
@@ -299,7 +309,7 @@ static class Program
     static DateTime _preFillAt = DateTime.MinValue;
     static IntPtr _reflowed;             // window last pushed onto its work area
     static DateTime _reflowedAt = DateTime.MinValue;
-    static int _reflows;                 // attempts on that window, in a row
+    static int _reflows;                 // fills on that window within one switch, see Apply
     static int _defers;                  // applies held back while the pointer is on the tray
     static readonly object Gate = new object();        // guards _debounce.Change only
     static readonly object SubjectGate = new object(); // guards _subject
@@ -561,6 +571,14 @@ static class Program
                 return;
             }
             Log("change " + actual + " -> " + v.State + ": " + v.Why);
+            // A switch is a new situation for the fill, and the streak cap in
+            // FillIfLeftBehind belongs to it: four attempts to keep an app from
+            // undoing one fill, not four attempts for the lifetime of the
+            // window. v1.5.6 only reset the streak when a *different* window
+            // was filled, so a fifth maximize of WeChat (or of an Explorer
+            // folder window) was left 48 px short until the tool restarted.
+            _reflows = 0;
+            _reflowed = IntPtr.Zero;
             // The call below blocks for 250-530 ms and the work area only grows
             // at the end of it, so a window that fills the work area now sits
             // 48 px short for that whole stretch. Grow it first, to where the
@@ -616,8 +634,13 @@ static class Program
             _preFillH = IntPtr.Zero;    // the switch took: nothing to undo
 
             // Look again shortly after a nudge: an app that answers the work-area
-            // change late re-applies its old rectangle over ours.
-            if (Reflow()) ArmVerify(700);
+            // change late re-applies its old rectangle over ours. Not while a
+            // parked tray is being fought: the off/on pair shrinks and grows the
+            // work area, so the window would be restored and maximized in the
+            // middle of it for no reason - and that churn is what made the
+            // toggle lose in one measured run. The fill happens after the tray
+            // is actually in, on the verify that follows.
+            if (_unwedges == 0 && Reflow()) ArmVerify(700);
 
             int px = TrayVisiblePixels();
             if (px <= 4) { _trayParked = 0; _unwedges = 0; return; }   // tucked away: fine
@@ -830,9 +853,26 @@ static class Program
             + " -> " + w + "x" + ht);
         if (IsZoomed(h))
         {
-            // Already maximized (WeChat): it has the maximized frame metrics,
-            // so moving it to the work area is safe.
-            if (!SetWindowPos(h, IntPtr.Zero, mi.rcWork.Left, mi.rcWork.Top, w, ht,
+            // A maximized window (WeChat) keeps the maximized rectangle it
+            // computed for the work area it had *before* the switch, and
+            // neither SetWindowPos nor a second SW_MAXIMIZE changes that:
+            // measured on 26300, a window moved to the new work area puts its
+            // old rectangle back in the same millisecond (Qt 5.15 on top of
+            // that), and a window that is already zoomed ignores SW_MAXIMIZE.
+            // Restore + maximize is what makes the window manager compute it
+            // again for the work area there is now - the same two steps a
+            // double click on the title bar does, and the only thing that ends
+            // the 48 px strip *and* the smaller strip the app's own late
+            // re-layout leaves behind (Qt lays a maximized WeChat out at
+            // 1707x1035 about 300 ms after the work area grows).
+            if (h == GetForegroundWindow())
+            {
+                ShowWindow(h, SW_RESTORE);
+                ShowWindow(h, SW_MAXIMIZE);
+            }
+            // Never restore/activate a window that is not in front; moving it
+            // to the work area is the best a background window gets.
+            else if (!SetWindowPos(h, IntPtr.Zero, mi.rcWork.Left, mi.rcWork.Top, w, ht,
                 SWP_NOZORDER | SWP_NOACTIVATE)) return false;
         }
         else
