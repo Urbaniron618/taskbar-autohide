@@ -78,6 +78,9 @@
 //     window out from under the cursor. While a move/size loop is running the
 //     taskbar is out, and no fill touches that window; the release event makes
 //     the decision for real. See InMoveSize / Decide.
+//   * A window the user put down by hand never hides the taskbar, however much
+//     of the work area it covers - "covers 85%" is for windows an app sized for
+//     itself. Only a maximized or fullscreen window does. See StateOf.
 //
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
@@ -276,6 +279,12 @@ static class Program
     static int _unwedges;                // corrective toggles since the tray last moved
     static int _trayParked;              // visible tray height on the last verify pass
     static DateTime _trayParkedAt = DateTime.MinValue;
+    // Windows the user put down by hand, see IsUserPlaced. The process id is
+    // part of the key on purpose: a window handle is reused as soon as its
+    // window dies, and a new window of another app is not "placed by hand".
+    static readonly IntPtr[] _userPlaced = new IntPtr[8];
+    static readonly uint[] _userPlacedPid = new uint[8];
+    static int _userPlacedNext;
     static IntPtr _preFillH;             // window grown before the switch, see PreFill
     static RECT _preFillR;               // ... and what it was before that
     static DateTime _preFillAt = DateTime.MinValue;
@@ -405,7 +414,10 @@ static class Program
         {
             // Starting a drag only has to bring the taskbar out; the end of it
             // is what needs a fresh look, because the window is only now where
-            // the user put it (and may have snapped to a whole screen).
+            // the user put it (and may have snapped to a whole screen). From
+            // then on it is a window the user placed - it never hides the
+            // taskbar just for being big (see StateOf).
+            if (evt == EVENT_SYSTEM_MOVESIZEEND) MarkUserPlaced(hwnd);
             LogEvent("event: " + (evt == EVENT_SYSTEM_MOVESIZESTART ? "movesize start "
                 : "movesize end ") + Describe(hwnd));
             Arm(evt == EVENT_SYSTEM_MOVESIZEEND ? 60 : 30, true);
@@ -621,7 +633,12 @@ static class Program
             if (++_unwedges > 3) return;    // a shell that keeps refusing: stop fighting it
             Log("wedge: tray parked on screen with auto-hide on -> toggling");
             SetAutoHide(false);
-            Thread.Sleep(150);
+            // Let the taskbar come all the way back before asking for "on"
+            // again. A fixed 150 ms landed in the middle of that transition on
+            // 26300 and the tray did not move at all - three attempts in a row
+            // changed nothing; once the work area is back, the next "on" moves
+            // the tray every time.
+            for (int i = 0; i < 30 && ActualState() != "off"; i++) Thread.Sleep(20);
             SetAutoHide(true);
             _lastApply = DateTime.UtcNow;
             _lastSafetyApply = DateTime.UtcNow;
@@ -992,7 +1009,45 @@ static class Program
 
     static string StateOf(IntPtr h)
     {
-        return (IsZoomed(h) || IsFullscreen(h) || CoversWorkArea(h)) ? "on" : "off";
+        if (IsZoomed(h) || IsFullscreen(h)) return "on";
+        // A window the user dragged or resized into place is where they put it:
+        // it does not hide the taskbar just for covering most of the work area.
+        // "Covers the work area" is for windows an app sized for itself - a
+        // video player, Steam Big Picture - not for something the user placed
+        // by hand and is looking at.
+        if (IsUserPlaced(h)) return "off";
+        return CoversWorkArea(h) ? "on" : "off";
+    }
+
+    // Windows the user has put down after dragging or resizing them. Eight is
+    // more than anybody drags in a session before the oldest matters, and an
+    // entry only ever means "this handle was placed by hand".
+    static void MarkUserPlaced(IntPtr h)
+    {
+        if (h == IntPtr.Zero) return;
+        uint pid;
+        GetWindowThreadProcessId(h, out pid);
+        for (int i = 0; i < _userPlaced.Length; i++)
+            if (_userPlaced[i] == h && _userPlacedPid[i] == pid) return;
+        _userPlaced[_userPlacedNext] = h;
+        _userPlacedPid[_userPlacedNext] = pid;
+        _userPlacedNext = (_userPlacedNext + 1) % _userPlaced.Length;
+    }
+
+    static bool IsUserPlaced(IntPtr h)
+    {
+        if (h == IntPtr.Zero) return false;
+        uint pid;
+        GetWindowThreadProcessId(h, out pid);
+        for (int i = 0; i < _userPlaced.Length; i++)
+        {
+            if (_userPlaced[i] != h) continue;
+            if (_userPlacedPid[i] == pid && IsWindow(h)) return true;
+            _userPlaced[i] = IntPtr.Zero;    // the window is gone, or the handle moved on
+            _userPlacedPid[i] = 0;
+            return false;
+        }
+        return false;
     }
 
     // Some players and game UIs never call ShowWindow(SW_MAXIMIZE): they size a

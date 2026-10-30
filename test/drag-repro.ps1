@@ -118,12 +118,26 @@ $r1 = Rect $h
 
 # The window is big now, so the ordinary rule wants the taskbar gone.
 $after = 'shown'
-for ($i = 0; $i -lt 12; $i++) {
+for ($i = 0; $i -lt 8; $i++) {
     Start-Sleep -Milliseconds 250
     $after = Taskbar
     if ($after -eq 'hidden') { break }
 }
-"after release: window=" + (Rect $h).W + "x" + (Rect $h).H + "  taskbar=" + $after
+$r2 = Rect $h
+"after release: window=" + $r2.W + "x" + $r2.H + "  taskbar=" + $after
+
+# Now maximize it for real. The taskbar belongs off for a maximized window,
+# hand-placed or not. (SW_MAXIMIZE rather than a double-click: Windows 11
+# Notepad's title bar is its own tab strip and does not always take one.)
+[Drag]::SetWindowPos($h, [IntPtr]::Zero, $r2.Left, $r2.Top, $r2.W, $r2.H, 0x0004 -bor 0x0010) | Out-Null
+[Drag]::ShowWindow($h, 3) | Out-Null
+$max = 'shown'
+for ($i = 0; $i -lt 12; $i++) {
+    Start-Sleep -Milliseconds 250
+    $max = Taskbar
+    if ($max -eq 'hidden') { break }
+}
+"after maximize: window=" + (Rect $h).W + "x" + (Rect $h).H + " zoom=" + [Drag]::IsZoomed($h) + "  taskbar=" + $max
 
 [Drag]::SetCursorPos(900, 600) | Out-Null
 Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -134,11 +148,17 @@ if ($during -contains 'hidden') {
 } else {
     'PASS  the taskbar stayed on screen for the whole drag'
 }
-if ($after -ne 'hidden') {
+if ($after -ne 'shown') {
     $fail++
-    'FAIL  the taskbar did not go away after the window was put down covering the work area'
+    'FAIL  the taskbar hid for a window the user had just placed by hand'
 } else {
-    'PASS  released over the work area: taskbar hidden again'
+    'PASS  put down by hand over the work area: the taskbar stays'
+}
+if ($max -ne 'hidden') {
+    $fail++
+    'FAIL  the taskbar did not go away after the window was maximized for real'
+} else {
+    'PASS  maximized for real: the taskbar hides'
 }
 
 if ($fail -eq 0) { 'all cases pass' } else { "$fail case(s) failed" }
