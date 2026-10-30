@@ -81,6 +81,11 @@
 //   * A window the user put down by hand never hides the taskbar, however much
 //     of the work area it covers - "covers 85%" is for windows an app sized for
 //     itself. Only a maximized or fullscreen window does. See StateOf.
+//   * Stretching a plain window to the work area with SetWindowPos gives it the
+//     maximized frame but the restored caption metrics: Explorer's tab strip
+//     lost its top 7 px to the screen edge. Such windows are now maximized for
+//     real (ShowWindow), which keeps the title bar intact and lets the shell
+//     re-lay it out when the work area grows. See FillIfLeftBehind / PreFill.
 //
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
@@ -232,6 +237,9 @@ static class Program
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr after,
         int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int cmd);
+    const int SW_MAXIMIZE = 3;
+    const int SW_RESTORE = 9;
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint idThread,
         ref GUITHREADINFO info);
 
@@ -732,18 +740,19 @@ static class Program
         _preFillH = h;
         _preFillR = r;
         _preFillAt = DateTime.UtcNow;
-        if (!SetWindowPos(h, IntPtr.Zero, target.Left, target.Top,
-            target.Right - target.Left, target.Bottom - target.Top,
-            SWP_NOZORDER | SWP_NOACTIVATE))
-        {
-            _preFillH = IntPtr.Zero;
-            return;
-        }
-        LogEvent("  pre-fill: " + Describe(h) + " " + (r.Right - r.Left) + "x" + (r.Bottom - r.Top)
-            + " -> " + (target.Right - target.Left) + "x" + (target.Bottom - target.Top));
+        // Maximize rather than set the rectangle: a plain window stretched to
+        // the whole work area gets the maximized frame from the window manager,
+        // but is still drawn with the restored window's caption metrics - the
+        // title bar ends up 7 px high and its top is cut off by the screen edge
+        // (reported with Explorer's tab strip). Maximizing is the real thing,
+        // and the shell then grows it into the work area on its own when the
+        // taskbar goes (measured: a maximized window re-lays itself out as the
+        // work area changes, ~0 ms after it does).
+        ShowWindow(h, SW_MAXIMIZE);
+        LogEvent("  pre-fill: maximized " + Describe(h) + " " + (r.Right - r.Left) + "x" + (r.Bottom - r.Top));
     }
 
-    // The switch did not take, so the window PreFill grew is 48 px under a
+    // The switch did not take, so the window PreFill maximized is sitting on a
     // taskbar that is still on screen. Put it back - once, and only while the
     // attempt is fresh; after that the window belongs to the app again.
     static void UndoPreFill()
@@ -754,10 +763,8 @@ static class Program
         if (h == IntPtr.Zero || !IsWindow(h)) return;
         if ((DateTime.UtcNow - at).TotalMilliseconds > 1500) return;
 
-        RECT r = _preFillR;
         Log("pre-fill undone: the taskbar did not go away -> " + Describe(h));
-        SetWindowPos(h, IntPtr.Zero, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top,
-            SWP_NOZORDER | SWP_NOACTIVATE);
+        ShowWindow(h, SW_RESTORE);
     }
 
     // Hiding the taskbar grows the work area, and explorer leaves it to the app
@@ -820,8 +827,21 @@ static class Program
         int ht = mi.rcWork.Bottom - mi.rcWork.Top;
         LogEvent("  reflow: " + Describe(h) + " " + (r.Right - r.Left) + "x" + (r.Bottom - r.Top)
             + " -> " + w + "x" + ht);
-        if (!SetWindowPos(h, IntPtr.Zero, mi.rcWork.Left, mi.rcWork.Top, w, ht,
-            SWP_NOZORDER | SWP_NOACTIVATE)) return false;
+        if (IsZoomed(h))
+        {
+            // Already maximized (WeChat): it has the maximized frame metrics,
+            // so moving it to the work area is safe.
+            if (!SetWindowPos(h, IntPtr.Zero, mi.rcWork.Left, mi.rcWork.Top, w, ht,
+                SWP_NOZORDER | SWP_NOACTIVATE)) return false;
+        }
+        else
+        {
+            // A plain window that was exactly the work area (Explorer's folder
+            // windows). Maximize it rather than move it: stretched to the work
+            // area by hand it is drawn with the restored window's caption and
+            // its title bar loses the top 7 px to the screen edge.
+            ShowWindow(h, SW_MAXIMIZE);
+        }
         Log("reflow: window left behind by the grown work area -> " + w + "x" + ht
             + ": " + Describe(h));
         return true;
