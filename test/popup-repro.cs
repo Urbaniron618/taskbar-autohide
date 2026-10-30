@@ -29,6 +29,11 @@
 //                                first failure)
 //   popup-repro.exe small <ms>   the control: 50% x 50%, the taskbar belongs on
 //                                screen
+//   popup-repro.exe workarea <ms>
+//                                a plain window, never maximized, exactly the
+//                                work area - how Explorer reopens a folder
+//                                window it had maximized (v1.5's failure: the
+//                                taskbar hid and left a 48 px strip below it)
 //
 // Build:
 //   csc /nologo /target:exe /out:popup-repro.exe test\popup-repro.cs
@@ -114,6 +119,7 @@ static class Repro
         if (mode == "borderless") return Borderless(hold);
         if (mode == "large") return Percent("repro large", 90, 99, hold);
         if (mode == "small") return Percent("repro small", 50, 50, hold);
+        if (mode == "workarea") return ExactWorkArea(hold);
         return Popup(hold);
     }
 
@@ -275,6 +281,29 @@ static class Repro
         ForceForeground(h);
         SleepPump(300);
         Console.WriteLine(title + " " + Describe(h) + " (" + wPct + "% x " + hPct + "% of work area)");
+        SleepPump(hold);
+        return 0;
+    }
+
+    // Explorer's folder-window shape: a plain window, never ShowWindow
+    // (SW_MAXIMIZE), that is exactly the work area it was opened on. Explorer
+    // reopens a folder window it had maximized like this - it stores the work
+    // area as the window's normal rectangle - so the window fills the screen
+    // while IsZoomed() stays false. v1.4 judged it "covers the work area" and
+    // hid the taskbar, but never grew it, so a 48 px strip of desktop stayed
+    // below the window.
+    static int ExactWorkArea(int hold)
+    {
+        MONITORINFO mi = Primary();
+        IntPtr h = CreateWindowEx(0, "STATIC", "repro workarea",
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            mi.rcWork.Left, mi.rcWork.Top,
+            mi.rcWork.Right - mi.rcWork.Left, mi.rcWork.Bottom - mi.rcWork.Top,
+            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        ShowWindow(h, SW_SHOW);
+        ForceForeground(h);
+        SleepPump(300);
+        Console.WriteLine("workarea " + Describe(h) + " (exactly the work area, never maximized)");
         SleepPump(hold);
         return 0;
     }

@@ -53,6 +53,14 @@
 //     slack cannot confuse a maximized window (48 px short while the taskbar is
 //     out) for a fullscreen one. See IsFullscreen.
 //
+// v1.5, found on Explorer folder windows opened from the desktop:
+//   * Explorer saves a folder window it maximized as a *plain* window whose
+//     normal rectangle is the whole work area (showCmd=1, IsZoomed=false), so
+//     reopening one gives a window that fills the screen without ever being
+//     maximized. v1.4 judged it "covers the work area" and hid the taskbar, but
+//     Reflow only grew windows that report IsZoomed, so the window stayed 48 px
+//     short and a strip of desktop sat below it. See SizedToWorkAreaWithTrayOut.
+//
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
 using System;
@@ -100,6 +108,11 @@ static class Program
     // whether or not it ever called ShowWindow(SW_MAXIMIZE). A snapped half is
     // 50%, a maximized window is ~101%; video players sit at 85-100%.
     const int LargeWindowPercent = 85;
+
+    // "Is this window sitting exactly on the work area?" needs a pixel or two
+    // of slack: Explorer's folder window lands 2 px inside it. Far below the
+    // 48 px the taskbar takes away, so the two cannot be confused.
+    const int FlushSlack = 6;
 
     delegate void WinEventProc(IntPtr hWinEventHook, uint evt, IntPtr hwnd,
                                int idObject, int idChild, uint thread, uint time);
@@ -554,23 +567,27 @@ static class Program
     // slides out from. Nothing in the shell corrects it: a second SC_MAXIMIZE is
     // ignored, and only a SetWindowPos to the work area moves the window.
     //
+    // Explorer's folder windows have the same symptom without ever being
+    // maximized (see SizedToWorkAreaWithTrayOut), so both shapes are filled.
+    //
     // Only ever the window in front (or the window a tool popup belongs to),
-    // only while it is maximized, and only when it does not already cover the
-    // work area - for every well-behaved app this is a no-op.
+    // only while it is maximized or exactly the work area, and only when it does
+    // not already cover the work area - for every well-behaved app this is a
+    // no-op.
     static bool Reflow()
     {
         IntPtr fg = GetForegroundWindow();
         if (fg == IntPtr.Zero) return false;
-        bool moved = FillIfMaximized(fg);
+        bool moved = FillIfLeftBehind(fg);
         IntPtr owner = GetAncestor(fg, GA_ROOTOWNER);
-        if (owner != IntPtr.Zero && owner != fg) moved |= FillIfMaximized(owner);
+        if (owner != IntPtr.Zero && owner != fg) moved |= FillIfLeftBehind(owner);
         return moved;
     }
 
-    static bool FillIfMaximized(IntPtr h)
+    static bool FillIfLeftBehind(IntPtr h)
     {
         if (h == IntPtr.Zero || !IsWindow(h)) return false;
-        if (!IsWindowVisible(h) || IsIconic(h) || !IsZoomed(h)) return false;
+        if (!IsWindowVisible(h) || IsIconic(h)) return false;
 
         RECT r;
         if (!GetWindowRect(h, out r)) return false;
@@ -578,6 +595,8 @@ static class Program
         MONITORINFO mi = new MONITORINFO();
         mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
         if (!GetMonitorInfo(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), ref mi)) return false;
+
+        if (!IsZoomed(h) && !SizedToWorkAreaWithTrayOut(r, mi)) return false;
 
         // A maximized window overlaps the work area by the width of its invisible
         // frame (7 px here). Anything that falls short of it was left behind.
@@ -601,9 +620,60 @@ static class Program
             + " -> " + w + "x" + ht);
         if (!SetWindowPos(h, IntPtr.Zero, mi.rcWork.Left, mi.rcWork.Top, w, ht,
             SWP_NOZORDER | SWP_NOACTIVATE)) return false;
-        Log("reflow: maximized window left behind by the grown work area -> " + w + "x" + ht
+        Log("reflow: window left behind by the grown work area -> " + w + "x" + ht
             + ": " + Describe(h));
         return true;
+    }
+
+    // Explorer does not maximize a folder window it reopens "maximized": it
+    // stores the whole work area as the window's *normal* rectangle instead
+    // (measured on 26300 - showCmd=1, rcNormal = the work area, IsZoomed=false),
+    // so the user gets a window that fills the screen while its title bar shows
+    // no restore - it is a normal window, not a maximized one. That rectangle is
+    // the work area as it is with the
+    // taskbar out; auto-hide then moves the work area down by the taskbar's
+    // height and leaves the window - and a 48 px strip of desktop - behind.
+    // Nothing in the shell grows it, and Reflow used to pass it up because
+    // IsZoomed said false.
+    //
+    // Recognised from geometry: the window sits exactly on the work area the
+    // taskbar is currently taking away. A video player sized to 90% of the work
+    // area stays out of this (that is v1.4's deliberate "do not resize it"),
+    // and a window on another monitor stays out too - the taskbar this tool
+    // toggles only changes the primary work area.
+    static bool SizedToWorkAreaWithTrayOut(RECT r, MONITORINFO mi)
+    {
+        MONITORINFO pm;
+        if (!PrimaryMonitor(out pm)) return false;
+        if (mi.rcMonitor.Left != pm.rcMonitor.Left || mi.rcMonitor.Top != pm.rcMonitor.Top
+            || mi.rcMonitor.Right != pm.rcMonitor.Right
+            || mi.rcMonitor.Bottom != pm.rcMonitor.Bottom) return false;
+
+        int tray = BottomTrayHeight(mi);
+        if (tray <= 0) return false;
+        int bottom = mi.rcWork.Bottom - tray;   // the work area while the tray was out
+
+        return r.Left <= mi.rcWork.Left + FlushSlack
+            && r.Top <= mi.rcWork.Top + FlushSlack
+            && r.Right >= mi.rcWork.Right - FlushSlack
+            && r.Bottom >= bottom - FlushSlack
+            && r.Bottom <= bottom + FlushSlack;
+    }
+
+    // Height of the tray while it is a bottom taskbar on this monitor, else 0.
+    // Auto-hidden, the tray window sits 2 px on screen with the same 48 px
+    // height, so this reads the bar, not what is visible of it.
+    static int BottomTrayHeight(MONITORINFO mi)
+    {
+        IntPtr t = FindWindow("Shell_TrayWnd", null);
+        if (t == IntPtr.Zero) return 0;
+        RECT r;
+        if (!GetWindowRect(t, out r)) return 0;
+        int h = r.Bottom - r.Top;
+        if (h < 20 || h > 120) return 0;                      // not a horizontal bar
+        if (r.Bottom < mi.rcMonitor.Bottom - 2) return 0;     // not on the bottom edge
+        if (r.Right <= mi.rcMonitor.Left || r.Left >= mi.rcMonitor.Right) return 0;
+        return h;
     }
 
     static string Describe(IntPtr h)
