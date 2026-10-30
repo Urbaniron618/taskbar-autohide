@@ -70,6 +70,15 @@
 //     where the work area is about to be, first, so the taskbar slides away
 //     over a window that is already full screen. See PreFill / UndoPreFill.
 //
+// v1.5.3, found while dragging windows around:
+//   * A window under the mouse crosses the "covers 85% of the work area" line
+//     in both directions within a second (drag it bigger, drag it smaller), so
+//     judging it while it was being dragged had the taskbar popping in and out
+//     under the mouse - and the v1.5.2 pre-fill would even have moved the
+//     window out from under the cursor. While a move/size loop is running the
+//     taskbar is out, and no fill touches that window; the release event makes
+//     the decision for real. See InMoveSize / Decide.
+//
 // ASCII only (PowerShell 5.1 / csc read BOM-less UTF-8 as ANSI on this machine).
 
 using System;
@@ -82,6 +91,8 @@ static class Program
 {
     // WinEvent constants
     const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    const uint EVENT_SYSTEM_MOVESIZESTART = 0x000A;
+    const uint EVENT_SYSTEM_MOVESIZEEND = 0x000B;
     const uint EVENT_SYSTEM_MINIMIZEEND = 0x0017;
     const uint EVENT_OBJECT_DESTROY = 0x8001;
     const uint EVENT_OBJECT_HIDE = 0x8003;
@@ -108,6 +119,7 @@ static class Program
     const int DWMWA_CLOAKED = 14;
     const uint SWP_NOZORDER = 0x0004;
     const uint SWP_NOACTIVATE = 0x0010;
+    const uint GUI_INMOVESIZE = 0x00000002;   // GetGUIThreadInfo, see InMoveSize
 
     // A borderless "fullscreen" window can be a pixel or two short; a maximized
     // window is a whole taskbar short. Four pixels tells them apart.
@@ -164,6 +176,16 @@ static class Program
         public int y;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct GUITHREADINFO
+    {
+        public int cbSize;
+        public uint flags;
+        public IntPtr hwndActive, hwndFocus, hwndCapture;
+        public IntPtr hwndMenuOwner, hwndMoveSize, hwndCaret;
+        public RECT rcCaret;
+    }
+
     // What to do with the taskbar, and what the decision was based on.
     // State is "on" / "off", or null for "leave it alone".
     struct Verdict
@@ -206,6 +228,9 @@ static class Program
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr after,
         int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint idThread,
+        ref GUITHREADINFO info);
 
     // Surfaces that belong to the shell itself. While one of them has the focus
     // the user is poking at the shell - a taskbar button, Start, search, the
@@ -235,7 +260,7 @@ static class Program
     static readonly string[] Desktop = { "Progman", "WorkerW" };
 
     static WinEventProc _proc;           // must stay referenced or the hook dies
-    static readonly IntPtr[] _hooks = new IntPtr[4];
+    static readonly IntPtr[] _hooks = new IntPtr[5];
     static Timer _debounce;
     static Timer _safety;                // periodic reality check, see OnSafety
     static Timer _verify;                // post-apply check of the tray itself
@@ -303,6 +328,11 @@ static class Program
                 IntPtr.Zero, _proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
             _hooks[3] = SetWinEventHook(EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZEEND,
                 IntPtr.Zero, _proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            // The start and the end of a move/size loop: the drag itself is
+            // judged "taskbar out" (see Decide), and the release is the moment
+            // the window finally is where the user put it.
+            _hooks[4] = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+                IntPtr.Zero, _proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
             _debounce = new Timer(OnDebounce, null, Timeout.Infinite, Timeout.Infinite);
             _verify = new Timer(OnVerify, null, Timeout.Infinite, Timeout.Infinite);
@@ -368,6 +398,17 @@ static class Program
             if (!subject && hwnd != GetForegroundWindow()) return;
             LogEvent("event: gone " + Describe(hwnd) + (subject ? " (subject)" : " (foreground)"));
             Arm(140, true);      // let the shell settle on whatever comes next
+            return;
+        }
+
+        if (evt == EVENT_SYSTEM_MOVESIZESTART || evt == EVENT_SYSTEM_MOVESIZEEND)
+        {
+            // Starting a drag only has to bring the taskbar out; the end of it
+            // is what needs a fresh look, because the window is only now where
+            // the user put it (and may have snapped to a whole screen).
+            LogEvent("event: " + (evt == EVENT_SYSTEM_MOVESIZESTART ? "movesize start "
+                : "movesize end ") + Describe(hwnd));
+            Arm(evt == EVENT_SYSTEM_MOVESIZEEND ? 60 : 30, true);
             return;
         }
 
@@ -657,6 +698,7 @@ static class Program
         // on one is undone in the same millisecond). Only plain windows that
         // happen to fill the work area - Explorer's folder windows - need this.
         if (IsZoomed(h)) return;
+        if (InMoveSize(h)) return;          // never move a window under the mouse
 
         RECT r;
         if (!GetWindowRect(h, out r)) return;
@@ -730,6 +772,7 @@ static class Program
     {
         if (h == IntPtr.Zero || !IsWindow(h)) return false;
         if (!IsWindowVisible(h) || IsIconic(h)) return false;
+        if (InMoveSize(h)) return false;    // never move a window under the mouse
 
         RECT r;
         if (!GetWindowRect(h, out r)) return false;
@@ -818,6 +861,25 @@ static class Program
         return h;
     }
 
+    // Is the user dragging or resizing this window right now? The shell keeps
+    // that per thread - a window in a move/size loop has GUI_INMOVESIZE set -
+    // and it is what tells "big window the user is looking at" apart from
+    // "window being dragged across the screen": a drag passes the 85% line in
+    // both directions within a second, which had the taskbar popping in and out
+    // while the mouse was down, and a fill would have pulled the window out
+    // from under the cursor.
+    static bool InMoveSize(IntPtr h)
+    {
+        GUITHREADINFO gti = new GUITHREADINFO();
+        gti.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+        uint pid;
+        uint tid = GetWindowThreadProcessId(h, out pid);
+        if (tid == 0) return false;
+        if (!GetGUIThreadInfo(tid, ref gti)) return false;
+        if ((gti.flags & GUI_INMOVESIZE) == 0) return false;
+        return gti.hwndMoveSize == IntPtr.Zero || gti.hwndMoveSize == h;
+    }
+
     static string Describe(IntPtr h)
     {
         if (h == IntPtr.Zero) return "(none)";
@@ -880,6 +942,17 @@ static class Program
         // A real window the user can see and is looking at.
         if (!shell && !helper && visible && !adjunct)
         {
+            // While the user drags or resizes it, the window is wherever the
+            // pointer is: it goes over the 85% line and back within a second,
+            // so judging it made the taskbar pop in and out under the mouse.
+            // The taskbar stays out until the window is put down; the release
+            // (EVENT_SYSTEM_MOVESIZEEND) brings the decision back.
+            if (InMoveSize(h))
+            {
+                v.State = "off"; v.Subject = h; v.Why = "fg=" + cls + " (moving)";
+                _lastUsable = h;
+                return v;
+            }
             v.State = IsIconic(h) ? "off" : StateOf(h);
             v.Subject = h; v.Why = "fg=" + cls;
             if (!IsIconic(h)) _lastUsable = h;
